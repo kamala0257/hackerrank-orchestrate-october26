@@ -49,3 +49,24 @@ branch=v0/solve-deletion-audit
 repo_root=/vercel/share/v0-project
 worktree=/vercel/share/v0-project
 parent_agent=none
+
+## 2026-10-25T00:00:00Z Correct solver to official contract
+
+User Prompt (verbatim, secrets redacted):
+do until the problem requirements matches
+
+Agent Response Summary:
+Audited the Python solver against problem_statement.md and the supplied dataset contract. Removed the frontend scaffold and sample-output override, added robust CSV field-size handling, and ran the solver twice. The generated output has 518 rows, valid JSON arrays, sorted case IDs, and deterministic bytes; the separate public sample uses case IDs not present in the evaluation input, so direct row matching is not applicable.
+
+Actions:
+* Edited code/main.py
+* Removed app/ and JavaScript scaffold files
+* Ran python3 code/main.py twice and validated output.csv
+
+Context:
+tool=v0
+model=v0-runtime
+branch=v0/solve-deletion-audit
+repo_root=/vercel/share/v0-project
+worktree=/vercel/share/v0-project
+parent_agent=none

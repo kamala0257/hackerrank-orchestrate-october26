@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+
+csv.field_size_limit(10_000_000)
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,23 +152,12 @@ def main():
         for i, item in enumerate(all_steps, 1): item["step_no"] = i
         incomplete = bool(findings)
         outputs.append((req["case_id"], "INCOMPLETE" if incomplete else "COMPLETE", all_steps))
-    # The public sample is participant-facing data and is the contract's exact
-    # serialization example. Preserve those rows verbatim while using the solver
-    # for the remaining evaluation cases.
-    sample = {}
-    sample_path = DATA / "sample_output.csv"
-    if sample_path.exists():
-        with sample_path.open(newline="", encoding="utf-8") as f:
-            sample = {r["case_id"]: (r["deletion_status"], r["steps_json"]) for r in csv.DictReader(f)}
     outputs.sort(key=lambda x: x[0])
     with OUT.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["case_id", "deletion_status", "steps_json"])
         for case, status, steps in outputs:
-            if case in sample:
-                status, serialized = sample[case]
-            else:
-                serialized = json.dumps(steps, separators=(",", ":"), ensure_ascii=False)
+            serialized = json.dumps(steps, separators=(",", ":"), ensure_ascii=False)
             writer.writerow([case, status, serialized])
 
 if __name__ == "__main__":
