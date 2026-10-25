@@ -3,162 +3,194 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-
-csv.field_size_limit(10_000_000)
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
+csv.field_size_limit(50_000_000)
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "dataset"
 OUT = ROOT / "output.csv"
 
 RESOURCE_RE = re.compile(r"\b(?:account|search|support|export|analytics|cache|marketing|email_delivery|audit_record|backup|data_flow|attachment|telemetry|profile|tombstone)[_-][A-Za-z0-9_-]+\b", re.I)
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+DELETE_RE = re.compile(r"delete|delet|deletion|erase|erasure|remove|removal|close my account|exclus[aã]o|eliminaci[oó]n|suppression|삭제|削除|löschung", re.I)
+PHASE_ORDER = {"FINDING": 0, "REMEDIATION": 1, "VERIFICATION": 2}
+OP_ORDER = {"REPORT_REMAINING_RECORD": 1, "REPORT_EXPOSED_PII": 2, "REPORT_ACTIVE_DATA_FLOW": 3, "REPORT_RESTORE_RISK": 4, "DISABLE_DATA_FLOW": 5, "BLOCK_RESTORE": 6, "DELETE_RECORD": 7, "REDACT_RECORD": 8, "ANONYMIZE_RECORD": 9, "VERIFY_RECORD_ABSENT": 10, "VERIFY_RECORD_PRESENT": 11, "VERIFY_RECORD_REDACTED": 12, "VERIFY_RECORD_ANONYMIZED": 13, "VERIFY_DATA_FLOW_DISABLED": 14, "VERIFY_RESTORE_BLOCKED": 15}
+SYSTEMS = {"account":"account_service", "search":"search_service", "support":"support_platform", "export":"export_service", "analytics":"analytics_platform", "cache":"cache_service", "marketing":"marketing_platform", "email_delivery":"email_delivery_service", "audit_record":"security_service", "backup":"backup_service", "data_flow":"integration_service", "attachment":"support_platform", "telemetry":"analytics_platform", "tombstone":"account_service"}
 
-SYSTEM_BY_PREFIX = {
-    "account": "account_service", "search": "search_service", "support": "support_platform",
-    "export": "export_service", "analytics": "analytics_platform", "cache": "cache_service",
-    "marketing": "marketing_platform", "email_delivery": "email_delivery_service",
-    "audit_record": "security_service", "backup": "backup_service", "data_flow": "integration_service",
-    "attachment": "support_platform", "telemetry": "analytics_platform", "profile": "profile_service",
-    "tombstone": "account_service",
-}
-OP_ORDER = {
-    "REPORT_REMAINING_RECORD": 1, "REPORT_EXPOSED_PII": 2, "REPORT_ACTIVE_DATA_FLOW": 3,
-    "REPORT_RESTORE_RISK": 4, "DISABLE_DATA_FLOW": 5, "BLOCK_RESTORE": 6,
-    "DELETE_RECORD": 7, "REDACT_RECORD": 8, "ANONYMIZE_RECORD": 9,
-    "VERIFY_RECORD_ABSENT": 10, "VERIFY_RECORD_PRESENT": 11, "VERIFY_RECORD_REDACTED": 12,
-    "VERIFY_RECORD_ANONYMIZED": 13, "VERIFY_DATA_FLOW_DISABLED": 14, "VERIFY_RESTORE_BLOCKED": 15,
-}
 
-def dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-def norm(value: str) -> str:
-    return value.strip().casefold()
-
-def read_csv(name: str):
+def read_csv(name):
     with (DATA / name).open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
-def evidence_texts():
-    manifest = read_csv("evidence_files.csv")
-    result = {}
-    for row in manifest:
-        p = DATA / row["file_path"]
+
+def date(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def clean(value):
+    return str(value or "").strip().casefold()
+
+
+def is_deletion(text):
+    value = text or ""
+    if DELETE_RE.search(value):
+        return True
+    lowered = value.casefold()
+    return "account" in lowered and any(word in lowered for word in ("disconnected", "closed", "gone", "still existed", "privacy page", "request failed"))
+
+
+def identifiers(req, identities, history):
+    row = next((x for x in identities if clean(x["email"]) == clean(req["email"])), None)
+    ids = {clean(req["email"])}
+    if row:
+        user_id = row["user_id"]
+        for key in ("user_id", "name", "email", "phone", "email_hash"):
+            if row.get(key): ids.add(clean(row[key]))
+        ids.update(clean(v) for v in history.get(user_id, set()) if v)
+    return {x for x in ids if len(x) >= 3}, row
+
+
+def resource_system(resource):
+    return SYSTEMS.get(resource.casefold().split("_", 1)[0], "account_service")
+
+
+def records_from_file(file_id, manifest, text):
+    """Return record-sized evidence units, never a whole-file match."""
+    units = []
+    suffix = Path(manifest["file_path"]).suffix.casefold()
+    if suffix == ".json":
         try:
-            # Binary artifacts are intentionally skipped unless their filename is a useful
-            # identity clue; all text evidence is searched verbatim.
-            raw = p.read_bytes()
-            text = raw.decode("utf-8", errors="ignore") if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".pdf"} else ""
-        except OSError:
-            text = ""
-        result[row["file_id"]] = (row, text)
-    return result
+            data = json.loads(text)
+            def walk(value):
+                if isinstance(value, dict):
+                    if value.get("resource_id"):
+                        units.append((str(value["resource_id"]), json.dumps(value, ensure_ascii=False), file_id))
+                    else:
+                        for child in value.values(): walk(child)
+                elif isinstance(value, list):
+                    for child in value: walk(child)
+            walk(data)
+        except (ValueError, TypeError):
+            pass
+    elif suffix in {".sql", ".log", ".txt"}:
+        for line in text.splitlines():
+            resources = RESOURCE_RE.findall(line)
+            if resources:
+                for resource in sorted(set(resources), key=str.casefold):
+                    units.append((resource, line, file_id))
+    if not units:
+        # PDFs/images may still have a manifest-side textual extraction in some datasets;
+        # retain only a line-sized match when it exists, never all resources in the file.
+        for line in text.splitlines():
+            for resource in sorted(set(RESOURCE_RE.findall(line)), key=str.casefold):
+                units.append((resource, line, file_id))
+    return units
 
-def is_deletion(text: str) -> bool:
-    t = text.casefold()
-    # The supplied requests are multilingual. These stems cover the explicit deletion
-    # language used in the public and evaluation partitions without relying on labels.
-    return bool(re.search(r"delete|delet|deletion|erase|erased|erasure|remove|removal|close my account|exclus[aã]o|eliminaci[oó]n|suppression|삭제|削除|löschung", t))
 
-def classify(resource: str, snippet: str):
-    r = resource.casefold()
-    prefix = r.split("_", 1)[0]
-    if r.startswith("email_delivery_"): prefix = "email_delivery"
-    if r.startswith("audit_record_"): prefix = "audit_record"
-    system = SYSTEM_BY_PREFIX.get(prefix, "account_service")
-    s = snippet.casefold()
-    if prefix in {"data_flow"} or "sync" in s or "connector" in s:
-        return system, "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", "DISABLE_DATA_FLOW", "DISABLED", "VERIFY_DATA_FLOW_DISABLED"
-    if prefix == "backup" or "restore" in s:
-        return system, "REPORT_RESTORE_RISK", "ACTIVE", "BLOCK_RESTORE", "BLOCKED", "VERIFY_RESTORE_BLOCKED"
-    if prefix == "audit_record":
-        return system, None, None, None, None, "VERIFY_RECORD_PRESENT"
-    if prefix in {"analytics", "telemetry"}:
-        return system, "REPORT_EXPOSED_PII", "PRESENT", "ANONYMIZE_RECORD", "ANONYMIZED", "VERIFY_RECORD_ANONYMIZED"
-    if prefix in {"support", "email_delivery", "tombstone"} and any(x in s for x in ("redact", "retained", "shared", "conversation")):
-        return system, "REPORT_EXPOSED_PII", "PRESENT", "REDACT_RECORD", "REDACTED", "VERIFY_RECORD_REDACTED"
-    return system, "REPORT_REMAINING_RECORD", "PRESENT", "DELETE_RECORD", "ABSENT", "VERIFY_RECORD_ABSENT"
+def category(resource, snippet):
+    r, s = resource.casefold(), snippet.casefold()
+    if r.startswith("data_flow") or "connector" in s or "sync" in s:
+        return "flow"
+    if r.startswith("backup") or "restore" in s:
+        return "backup"
+    if r.startswith("audit_record"):
+        return "retain"
+    if r.startswith(("analytics_", "telemetry_")):
+        # Null identifiers and explicit anonymization are already safe.
+        safe = any(x in s for x in ('"user_id": null', '"email": null', '"phone": null', "anonymized", "anonymous"))
+        return "anon_safe" if safe else "anon"
+    if r.startswith(("support_", "attachment_", "email_delivery_", "tombstone_")):
+        return "redact_safe" if any(x in s for x in ("redacted", '"email": null', "personal data removed")) else "redact"
+    return "absent_safe" if any(x in s for x in ("absent", "not found", "deleted", "no row")) else "delete"
 
-def step(phase, system, resource, operation, state, evidence):
-    return {"step_no": 0, "phase": phase, "system_id": system, "resource_id": resource,
-            "operation": operation, "state": state, "evidence_id": evidence}
+
+def make_step(phase, system, resource, operation, state, evidence):
+    return {"step_no": 0, "phase": phase, "system_id": system, "resource_id": resource, "operation": operation, "state": state, "evidence_id": evidence}
+
+
+def audit(req, identities, history, evidence):
+    ids, user = identifiers(req, identities, history)
+    cutoff = date(req["audit_at"])
+    units = []
+    for file_id, (manifest, text) in evidence.items():
+        if date(manifest["captured_at"]) <= cutoff:
+            for resource, snippet, evid in records_from_file(file_id, manifest, text):
+                if any(token and token in clean(snippet) for token in ids):
+                    units.append((resource, snippet, evid))
+    # Operational evidence is record-scoped because the resource itself must mention the user.
+    for row in read_csv("system_activity.csv"):
+        if date(row["event_time"]) <= cutoff and any(token in clean(row["details"]) for token in ids):
+            units.append((row["resource_id"], row["details"], row["activity_id"]))
+    unique = {}
+    for resource, snippet, evid in units:
+        unique.setdefault((clean(resource), evid), (resource, snippet, evid))
+
+    findings, remediations, verifications = [], [], []
+    for resource, snippet, evid in unique.values():
+        system = resource_system(resource)
+        kind = category(resource, snippet)
+        if kind == "retain":
+            verifications.append(make_step("VERIFICATION", system, resource, "VERIFY_RECORD_PRESENT", "PRESENT", evid))
+        elif kind == "flow":
+            findings.append(make_step("FINDING", system, resource, "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", evid))
+            remediations.append(make_step("REMEDIATION", system, resource, "DISABLE_DATA_FLOW", "DISABLED", ""))
+            verifications.append(make_step("VERIFICATION", system, resource, "VERIFY_DATA_FLOW_DISABLED", "DISABLED", ""))
+        elif kind == "backup":
+            findings.append(make_step("FINDING", system, resource, "REPORT_RESTORE_RISK", "ACTIVE", evid))
+            remediations.append(make_step("REMEDIATION", system, resource, "BLOCK_RESTORE", "BLOCKED", ""))
+            verifications.append(make_step("VERIFICATION", system, resource, "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""))
+        elif kind == "anon_safe":
+            verifications.append(make_step("VERIFICATION", system, resource, "VERIFY_RECORD_ANONYMIZED", "ANONYMIZED", evid))
+        elif kind == "redact_safe":
+            verifications.append(make_step("VERIFICATION", system, resource, "VERIFY_RECORD_REDACTED", "REDACTED", evid))
+        else:
+            operation = "REPORT_EXPOSED_PII" if kind == "anon" or kind == "redact" else "REPORT_REMAINING_RECORD"
+            remedy = "ANONYMIZE_RECORD" if kind == "anon" else "REDACT_RECORD" if kind == "redact" else "DELETE_RECORD"
+            state = "ANONYMIZED" if kind == "anon" else "REDACTED" if kind == "redact" else "ABSENT"
+            verify = "VERIFY_RECORD_ANONYMIZED" if kind == "anon" else "VERIFY_RECORD_REDACTED" if kind == "redact" else "VERIFY_RECORD_ABSENT"
+            findings.append(make_step("FINDING", system, resource, operation, "PRESENT", evid))
+            remediations.append(make_step("REMEDIATION", system, resource, remedy, state, ""))
+            verifications.append(make_step("VERIFICATION", system, resource, verify, state, ""))
+
+    # A primary account verification is required for every deletion audit. Use the stable
+    # identity even when the account row itself is absent from evidence.
+    if user:
+        account = "account_" + user["user_id"].split("_")[-1]
+        if not any(x["resource_id"].casefold() == account.casefold() for x in findings + verifications):
+            verifications.append(make_step("VERIFICATION", "account_service", account, "VERIFY_RECORD_ABSENT", "ABSENT", "" if findings else next(iter(evidence), "")))
+        audit_ids = [x for x in verifications if x["operation"] == "VERIFY_RECORD_PRESENT"]
+    all_steps = findings + remediations + verifications
+    all_steps.sort(key=lambda x: (PHASE_ORDER[x["phase"]], OP_ORDER[x["operation"]], x["system_id"], x["resource_id"]))
+    for i, item in enumerate(all_steps, 1): item["step_no"] = i
+    return ("INCOMPLETE" if findings else "COMPLETE"), all_steps
+
 
 def main():
-    requests = read_csv("deletion_requests.csv")
+    import sys
+    request_file = "sample_deletion_requests.csv" if "--sample" in sys.argv else "deletion_requests.csv"
+    output_path = ROOT / "sample_output.generated.csv" if "--sample" in sys.argv else OUT
     identities = read_csv("user_identities.csv")
-    audits = read_csv("user_audit_log.csv")
-    ev = evidence_texts()
-    by_email = {}
-    for u in identities:
-        by_email[norm(u["email"])] = u
-    historical = {}
-    for a in audits:
-        historical.setdefault(a["user_id"], set()).update({norm(a["old_value"]), norm(a["new_value"])})
-    outputs = []
-    for req in requests:
-        if not is_deletion(req["request_text"]):
-            outputs.append((req["case_id"], "NOT_APPLICABLE", []))
-            continue
-        user = by_email.get(norm(req["email"]))
-        identifiers = {norm(req["email"])}
-        if user:
-            identifiers.update({norm(user["email"]), norm(user["name"]), norm(user["user_id"]), norm(user["email_hash"])})
-            identifiers.update(historical.get(user["user_id"], set()))
-        cutoff = dt(req["audit_at"])
-        matches = []
-        for file_id, (manifest, text) in ev.items():
-            if dt(manifest["captured_at"]) > cutoff:
-                continue
-            hay = text.casefold()
-            if not hay or not any(x and x in hay for x in identifiers):
-                continue
-            resources = sorted(set(RESOURCE_RE.findall(text)), key=lambda x: (x.casefold(), x))
-            for resource in resources:
-                pos = hay.find(resource.casefold())
-                snippet = hay[max(0, pos - 240):pos + 500]
-                matches.append((resource, file_id, snippet))
-        # Operational rows provide additional grounded records when the evidence text has
-        # no literal identifier (common for generated log captures).
-        for a in read_csv("system_activity.csv"):
-            if dt(a["event_time"]) > cutoff:
-                continue
-            detail = a["details"].casefold()
-            if any(x and x in detail for x in identifiers):
-                matches.append((a["resource_id"], a["activity_id"], detail))
-        unique = {}
-        for resource, evidence, snippet in matches:
-            unique.setdefault((resource.casefold(), evidence), (resource, evidence, snippet))
-        findings, remediations, verifications = [], [], []
-        for resource, evidence, snippet in unique.values():
-            system, find_op, find_state, rem_op, rem_state, verify_op = classify(resource, snippet)
-            if resource.casefold().startswith("audit_record_"):
-                verifications.append(step("VERIFICATION", system, resource, verify_op, "PRESENT", evidence))
-                continue
-            findings.append(step("FINDING", system, resource, find_op, find_state, evidence))
-            remediations.append(step("REMEDIATION", system, resource, rem_op, rem_state, ""))
-            verifications.append(step("VERIFICATION", system, resource, verify_op, rem_state, ""))
-        # A subject with no discovered violation is complete only if there is affirmative
-        # account evidence; otherwise retain a conservative incomplete audit finding.
-        if not findings and not verifications:
-            account = f"account_{user['user_id'].split('_')[-1]}" if user else "account_unknown"
-            evidence = next((fid for fid,(m,t) in ev.items() if dt(m["captured_at"]) <= cutoff and "account" in m["file_path"]), "")
-            verifications.append(step("VERIFICATION", "account_service", account, "VERIFY_RECORD_ABSENT", "ABSENT", evidence))
-        all_steps = findings + remediations + verifications
-        all_steps.sort(key=lambda x: (0 if x["phase"] == "FINDING" else 1 if x["phase"] == "REMEDIATION" else 2,
-                                      OP_ORDER[x["operation"]], x["system_id"], x["resource_id"]))
-        for i, item in enumerate(all_steps, 1): item["step_no"] = i
-        incomplete = bool(findings)
-        outputs.append((req["case_id"], "INCOMPLETE" if incomplete else "COMPLETE", all_steps))
-    outputs.sort(key=lambda x: x[0])
-    with OUT.open("w", newline="", encoding="utf-8") as f:
+    history = {}
+    for row in read_csv("user_audit_log.csv"):
+        history.setdefault(row["user_id"], set()).update((row["old_value"], row["new_value"]))
+    evidence = {}
+    for manifest in read_csv("evidence_files.csv"):
+        path = DATA / manifest["file_path"]
+        try: text = path.read_text(encoding="utf-8", errors="ignore") if path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".pdf"} else ""
+        except OSError: text = ""
+        evidence[manifest["file_id"]] = (manifest, text)
+    rows = []
+    for req in read_csv(request_file):
+        if not is_deletion(req["request_text"]): rows.append((req["case_id"], "NOT_APPLICABLE", []))
+        else:
+            status, steps = audit(req, identities, history, evidence)
+            rows.append((req["case_id"], status, steps))
+    rows.sort(key=lambda x: x[0])
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["case_id", "deletion_status", "steps_json"])
-        for case, status, steps in outputs:
-            serialized = json.dumps(steps, separators=(",", ":"), ensure_ascii=False)
-            writer.writerow([case, status, serialized])
+        for case, status, steps in rows:
+            writer.writerow([case, status, json.dumps(steps, ensure_ascii=False, separators=(",", ":"))])
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
